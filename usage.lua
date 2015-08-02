@@ -5,41 +5,55 @@
 -- Example
 -- -------
 --
--- usage "vendor_lib"
---   defines "USING_VENDOR_LIB"
---   includedirs "vendor/include"
---   links "vendor/lib"
--- end
+-- usage "vendor"
+--   defines "USING_VENDOR"
+--   includedirs "include/vendor"
+--   links "lib/vendor"
 --
--- project "core_lib"
+-- project "core"
 --   kind "SharedLib"
---   uses "vendor_lib"
+--   uses "vendor"
+--   uses "core"
+--
+-- usage "core"
+--   links "openssh"
+--   includedirs "include/core"
 --
 -- project "app"
 --   kind "ConsoleApp"
 --   uses "core_lib"
 --
--- "app" will link 'core_lib' and define 'USING_VENDOR_LIB'
--- If "core_lib" was a StaticLib, the vendor/lib dependency would pass through.
--- "app" would then link 'vendor/lib' and 'core_lib', and still define
--- 'USING_VENDOR_LIB'
+-- "core" will link vendor and openssh and define 'USING_VENDOR'
+-- "app" will link 'core' and define 'USING_VENDOR'
+-- If "core" was a StaticLib, the link dependencies would pass through.
+-- "core" will define 'USING_VENDOR'
+-- "app" would link 'vendor', 'core', and 'openssh' and still define
+-- 'USING_VENDOR'
 --
 -- Notes
 -- -----
 --
 -- 'uses' are recursive.
+--
+-- If a project and usage exist, the project is used first, then the usage.
+--
+-- If a project uses itself, any link dependencies in the usage will be
+-- consumed by the project as needed. Otherwise those link dependencies
+-- will pass onto to the user.
+--
+-- Using a project will link the project and resolves nested uses,
+-- in addition to any declared usage.
+--
+-- TO CONSIDER: not sure this is needed anymore.
 -- 'uses' can filter down to 'linkoptions' or 'buildoptions'
 --    uses "linkoptions:opengl"
 --    uses "buildoptions:opengl"
---
 -- link options are defined as: links, linkoptions, libdirs.
 -- buildoptions are defined as anything that isn't a link option.
 -- TO CONSIDER: separate api, uses_linkoptions/uses_buildoptions?
 --
--- Using a project that doesn't declare a 'usage' will link the project
--- and recursively resolves nested uses within that project.
---
--- The context of a 'usage' is the ultimate target context it is being used in.
+-- The context of a 'usage' is the ultimate target context it is being
+-- used in.
 --
 -- usage "external_lib"
 --   links "external_lib-%{cfg.buildcfg}"
@@ -67,11 +81,6 @@
 --   first use?
 --
 --   Handle block insertion ordering and 'removes' correctly
---
---   This fails:
---   project "lib"
---  	 kind "StaticLib"
---  	 uses "lib"
 --
 
 	local p = premake
@@ -128,168 +137,177 @@ p.api.register {
 
 
 --
--- Resolve a single 'use', with a given filter and criteria,
--- into a target block of a target project
+-- resolveUsage
 --
 
 	local resolveAllUsesInBlock
+
+	local function resolveUsage( targetProject, targetBlock,
+								 usage, usageName, usageFilter,
+								 inheritedCriteria )
+
+		verbosef("\nProject %s is using usage %s %s\n",
+				 targetProject.name, usage.name, usageFilter or "" )
+
+		-- A map for how to copy the usage blocks into the target project.
+		-- Each entry in the map creates a new block.
+
+		local propagateMap = {}
+
+		local commonFields = { "_criteria", "_basedir", "uses" }
+		local linkFields   = { "links", "linkoptions", "libdirs" }
+
+		if usageFilter == nil then
+
+			-- We don't have a filter.
+			-- Create one block with the build options,
+			-- and another with only the links options that is filtered
+			-- for just link targets.
+
+			table.insert( propagateMap, {
+					usageFilter   = "buildoptions",
+					excludeFields = linkFields
+				} )
+
+			table.insert( propagateMap, {
+					terms = {'kind:not StaticLib'},
+					usageFilter   = "linkoptions",
+					includeFields = table.join( commonFields, linkFields )
+				} )
+		else
+
+			-- Respect the filter we have, and create one block with
+			-- either build or linkoptions
+
+			if usageFilter == "buildoptions" then
+				table.insert( propagateMap, {
+					usageFilter   = "buildoptions",
+					excludeFields = linkFields
+				} )
+			end
+
+			if usageFilter == "linkoptions" then
+				table.insert( propagateMap, {
+					usageFilter   = "linkoptions",
+					includeFields = table.join( commonFields, linkFields )
+				} )
+			end
+
+		end
+
+		-- Clone each block in the usage and insert it into the target project
+
+		for _,propagate in ipairs(propagateMap) do
+
+			verbosef("\nApplying %s to project %s from using usage %s\n",
+					 propagate.usageFilter, targetProject.name, usage.name )
+
+			for _,usageBlock in ipairs(usage.blocks) do
+
+				-- Merge the criteria for the usage, target, propagate
+				-- with any inherited criteria
+
+				local newBlock = table.deepcopy(usageBlock)
+
+				newBlock._criteria.patterns = table.join(
+					newBlock._criteria.patterns,
+					targetBlock._criteria.patterns )
+
+				if inheritedCriteria ~= nil then
+					newBlock._criteria.patterns = table.join(
+						newBlock._criteria.patterns,
+						inheritedCriteria.patterns )
+				end
+
+				if propagate.terms ~= nil then
+					local propagateCriteria =
+						p.criteria.new( propagate.terms )
+
+					newBlock._criteria.patterns = table.join(
+						newBlock._criteria.patterns,
+						propagateCriteria.patterns )
+				end
+
+				newBlock._criteria.data =
+					p.criteria._compile(newBlock._criteria.patterns)
+
+				-- todo: would be nice not to do this.
+				--  	 needs to be in sync with internal block logic.
+				if newBlock.filename then
+					newBlock.filename = nil
+					newBlock._basedir = newBlock.basedir
+					newBlock.basedir = nil
+				end
+
+				-- Filter the field set of the new block to the ones we
+				-- are propagating
+
+				for field,v in pairs(usageBlock) do
+
+					local reject = false
+
+					if propagate.excludeFields ~= nil then
+						reject = table.contains(
+							propagate.excludeFields, field )
+					end
+
+					if propagate.includeFields ~= nil then
+						reject = reject or not table.contains(
+							propagate.includeFields, field )
+					end
+
+					if reject then
+						verbosef("ignoring %s from %s %s",
+								 field, usage.name, propagate.usageFilter)
+
+						newBlock[field] = nil
+					else
+						verbosef("keeping %s from %s %s",
+								 field, usage.name, propagate.usageFilter)
+					end
+				end
+
+				-- Insert the new block into the target project.
+				-- TODO: We need to insert as if at the call site,
+				--  	 and it need to deal with with 'removes'
+				--  	 merging between the two blocks.
+
+				table.insert( targetProject.blocks, newBlock )
+
+				-- Recurse into the new block and resolve any 'uses' there
+
+				resolveAllUsesInBlock(
+					targetProject,
+					newBlock,
+					propagate.usageFilter )
+			end
+		end
+	end
+
+
+--
+-- Resolve a single 'use', with a given filter and criteria,
+-- into a target block of a target project
+--
 
 	local function resolveUse( targetProject, targetBlock,
 							   usageName, usageFilter, inheritedCriteria )
 
 		local targetWorkspace = targetProject.solution
 
+		local sourceProject = p.workspace.findproject(
+			targetWorkspace, usageName )
+
 		local usage = p.workspace.findusage( targetWorkspace, usageName)
 
-		if usage ~= nil then
+		if sourceProject == nil and usage == nil then
+			error("Use of "
+				  .. "'" .. usageName.. "'"
+				  .. ", is not defined as a usage or project in workspace "
+				  .. "'" .. targetWorkspace.name .. "'")
+		end
 
-			verbosef("\nProject %s is using usage %s %s\n",
-					 targetProject.name, usage.name, usageFilter or "" )
-
-			-- A map for how to copy the usage blocks into the target project.
-			-- Each entry in the map creates a new block.
-
-			local propagateMap = {}
-
-			local commonFields = { "_criteria", "_basedir", "uses" }
-			local linkFields   = { "links", "linkoptions", "libdirs" }
-
-			if usageFilter == nil then
-
-				-- We don't have a filter.
-				-- Create one block with the build options,
-				-- and another with only the links options that is filtered
-				-- for just link targets.
-
-				table.insert( propagateMap, {
-						usageFilter   = "buildoptions",
-						excludeFields = linkFields
-					} )
-
-				table.insert( propagateMap, {
-						terms = {'kind:not StaticLib'},
-						usageFilter   = "linkoptions",
-						includeFields = table.join( commonFields, linkFields )
-					} )
-			else
-
-				-- Respect the filter we have, and create one block with
-				-- either build or linkoptions
-
-				if usageFilter == "buildoptions" then
-					table.insert( propagateMap, {
-						usageFilter   = "buildoptions",
-						excludeFields = linkFields
-					} )
-				end
-
-				if usageFilter == "linkoptions" then
-					table.insert( propagateMap, {
-						usageFilter   = "linkoptions",
-						includeFields = table.join( commonFields, linkFields )
-					} )
-				end
-
-			end
-
-			-- Clone each block in the usage and insert it into the target project
-
-			for _,propagate in ipairs(propagateMap) do
-
-				verbosef("\nApplying %s to project %s from using usage %s\n",
-						 propagate.usageFilter, targetProject.name, usage.name )
-
-				for _,usageBlock in ipairs(usage.blocks) do
-
-					-- Merge the criteria for the usage, target, propagate
-					-- with any inherited criteria
-
-					local newBlock = table.deepcopy(usageBlock)
-
-					newBlock._criteria.patterns = table.join(
-						newBlock._criteria.patterns,
-						targetBlock._criteria.patterns )
-
-					if inheritedCriteria ~= nil then
-						newBlock._criteria.patterns = table.join(
-							newBlock._criteria.patterns,
-							inheritedCriteria.patterns )
-					end
-
-					if propagate.terms ~= nil then
-						local propagateCriteria =
-							p.criteria.new( propagate.terms )
-
-						newBlock._criteria.patterns = table.join(
-							newBlock._criteria.patterns,
-							propagateCriteria.patterns )
-					end
-
-					newBlock._criteria.data =
-						p.criteria._compile(newBlock._criteria.patterns)
-
-					-- todo: would be nice not to do this.
-					--  	 needs to be in sync with internal block logic.
-					if newBlock.filename then
-						newBlock.filename = nil
-						newBlock._basedir = newBlock.basedir
-						newBlock.basedir = nil
-					end
-
-					-- Filter the field set of the new block to the ones we
-					-- are propagating
-
-					for field,v in pairs(usageBlock) do
-
-						local reject = false
-
-						if propagate.excludeFields ~= nil then
-							reject = table.contains(
-								propagate.excludeFields, field )
-						end
-
-						if propagate.includeFields ~= nil then
-							reject = reject or not table.contains(
-								propagate.includeFields, field )
-						end
-
-						if reject then
-							verbosef("ignoring %s from %s %s",
-									 field, usage.name, propagate.usageFilter)
-
-							newBlock[field] = nil
-						else
-							verbosef("keeping %s from %s %s",
-									 field, usage.name, propagate.usageFilter)
-						end
-					end
-
-					-- Insert the new block into the target project.
-					-- TODO: We need to insert as if at the call site,
-					--  	 and it need to deal with with 'removes'
-					--  	 merging between the two blocks.
-
-					table.insert( targetProject.blocks, newBlock )
-
-					-- Recurse into the new block and resolve any 'uses' there
-
-					resolveAllUsesInBlock(
-						targetProject,
-						newBlock,
-						propagate.usageFilter )
-				end
-			end
-		else
-
-			local sourceProject = p.workspace.findproject(
-				targetWorkspace, usageName )
-
-			if sourceProject == nil then
-				error("Use of "
-					  .. "'" .. usageName.. "'"
-					  .. ", is not defined as a usage or project in workspace "
-					  .. "'" .. targetWorkspace.name .. "'")
-			end
+		if sourceProject ~= nil and sourceProject.name ~= targetProject.name then
 
 			verbosef("\nProject %s is using project %s\n",
 					 targetProject.name, sourceProject.name )
@@ -332,18 +350,51 @@ p.api.register {
 					-- Pass on this configuration as a criteria for the resolve.
 
 					-- todo: already exists in configCtx._criteria
+					-- todo: should be merging with inheritedCriteria?
 					local configCriteria =
 						p.criteria.new( {'configurations:' .. configName } )
 
 					local configUses = context.fetchvalue( configCtx, 'uses' )
 
+					local usedSelf = false
+
 					for k,v in ipairs(configUses) do
-						resolveUse( targetProject,
-									targetBlock,
-									v,
-									configUsageFilter or usageFilter,
-									configCriteria )
+
+						if v == sourceProject.name then
+							usedSelf = true
+							if usage then
+								resolveUsage( targetProject, targetBlock,
+											  usage, v, configUsageFilter or usageFilter,
+											  configCriteria )
+							else
+								error( "Project " .. sourceProject.name
+									   .. " used itself but declares no usage")
+							end
+						else
+							resolveUse( targetProject,
+										targetBlock,
+										v,
+										configUsageFilter or usageFilter,
+										configCriteria )
+						end
 					end
+
+					-- The project did not use it's own usage
+					-- It is only exposing it only visible to other project.
+					-- Don't apply configUsageFilter
+					-- TO CONSIDER: not sure about that, but makes sense if we've not
+					--              linked internally what's specified in our usage.
+
+					if usage and not usedSelf then
+
+						verbosef("= Project %s config %s, did not resolve own usage to %s. Resolving now\n",
+								 sourceProject.name, configName, targetProject.name )
+
+						resolveUsage( targetProject, targetBlock,
+									  usage, usageName, usageFilter,
+									  configCriteria )
+					end
+
 				end
 			end
 
@@ -391,9 +442,15 @@ p.api.register {
 												sourceProject.name )
 			end
 
+		elseif usage ~= nil then
+
+			resolveUsage( targetProject, targetBlock,
+						  usage, usageName, usageFilter,
+						  inheritedCriteria )
 		end
 
 	end
+
 
 --
 -- Resolve all uses from a target block in a target project
